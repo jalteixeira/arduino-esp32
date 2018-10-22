@@ -25,6 +25,11 @@
 #include "soc/dport_reg.h"
 #include "esp_attr.h"
 
+unsigned char twi_dcount = 18;
+static unsigned char twi_sda, twi_scl;
+static uint32_t twi_clockStretchLimit;
+static unsigned char twi_addr = 0;
+
 //#define I2C_DEV(i)   (volatile i2c_dev_t *)((i)?DR_REG_I2C1_EXT_BASE:DR_REG_I2C_EXT_BASE)
 //#define I2C_DEV(i)   ((i2c_dev_t *)(REG_I2C_BASE(i)))
 #define I2C_SCL_IDX(p)  ((p==0)?I2CEXT0_SCL_OUT_IDX:((p==1)?I2CEXT1_SCL_OUT_IDX:0))
@@ -52,6 +57,9 @@ static uint32_t intPos[2]= {0,0};
 static uint16_t fifoBuffer[FIFOMAX];
 static uint16_t fifoPos = 0;
 #endif
+
+static void (*i2cOnSlaveTransmit)(void);
+static void (*twi_onSlaveReceive)(uint8_t*, size_t);
 
 // start from tools/sdk/include/soc/soc/i2c_struct.h
 
@@ -124,6 +132,14 @@ typedef enum {
     I2C_TIMEOUT
 } I2C_ERROR_t;
 
+typedef enum {
+  I2C_LEVEL_OK=0,
+  I2C_SCL_HELD_LOW=1,
+  I2C_SCL_HELD_LOW_AFTER_READ=2,
+  I2C_SDA_HELD_LOW=3,
+  I2C_SDA_HELD_LOW_AFTER_INIT=4
+} i2c_level_t;
+
 // i2c_event bits for EVENTGROUP bits
 // needed to minimize change events, FreeRTOS Daemon overload, so ISR will only set values
 // on Exit.  Dispatcher will set bits for each dq before/after ISR completion
@@ -167,26 +183,36 @@ typedef struct {
 } I2C_DATA_QUEUE_t;
 
 struct i2c_struct_t {
-    i2c_dev_t * dev;
-#if !CONFIG_DISABLE_HAL_LOCKS
-    xSemaphoreHandle lock;
-#endif
-    uint8_t num;
-    int8_t sda;
-    int8_t scl;
-    I2C_MODE_t mode;
-    I2C_STAGE_t stage;
-    I2C_ERROR_t error;
-    EventGroupHandle_t i2c_event; // a way to monitor ISR process
-    // maybe use it to trigger callback for OnRequest()
-    intr_handle_t intr_handle;       /*!< I2C interrupt handle*/
-    I2C_DATA_QUEUE_t * dq;
-    uint16_t queueCount; // number of dq entries in queue.
-    uint16_t queuePos; // current queue that still has or needs data (out/in)
-    int16_t  errorByteCnt;  // byte pos where error happened, -1 devId, 0..(length-1) data
-    uint16_t errorQueue; // errorByteCnt is in this queue,(for error locus)
-    uint32_t exitCode;
-    uint32_t debugFlags;
+  i2c_dev_t * dev;
+  #if !CONFIG_DISABLE_HAL_LOCKS
+  xSemaphoreHandle lock;
+  #endif
+  uint8_t num;
+  int8_t sda;
+  int8_t scl;
+  I2C_MODE_t mode;
+  I2C_STAGE_t stage;
+  I2C_ERROR_t error;
+  EventGroupHandle_t i2c_event; // a way to monitor ISR process
+  // maybe use it to trigger callback for OnRequest()
+  intr_handle_t intr_handle;       /*!< I2C interrupt handle*/
+  I2C_DATA_QUEUE_t * dq;
+  uint16_t queueCount; // number of dq entries in queue.
+  uint16_t queuePos; // current queue that still has or needs data (out/in)
+  int16_t  errorByteCnt;  // byte pos where error happened, -1 devId, 0..(length-1) data
+  uint16_t errorQueue; // errorByteCnt is in this queue,(for error locus)
+  uint32_t exitCode;
+  uint32_t debugFlags;
+  i2c_protocol_mode_t twip_mode;
+  i2c_protocol_state_t twip_state;
+  i2c_state_t twi_state;
+  uint8_t bit_count;
+  uint8_t twip_status;
+  uint8_t twi_error; // DEPRECATE in favour of I2C_ERROR_t
+  uint8_t twi_data; // 0x00
+  uint8_t twi_ack;
+  uint8_t twi_ack_rec;
+  uint8_t twdr;
 };
 
 enum {
@@ -1349,16 +1375,21 @@ static void i2cReleaseISR(i2c_t * i2c)
     }
 }
 
-static bool i2cCheckLineState(int8_t sda, int8_t scl){
-     if(sda < 0 || scl < 0){
-        return false;//return false since there is nothing to do
+static bool i2cCheckLineState(i2c_t * i2c){
+    
+    int8_t sda = i2c->sda;
+    int8_t scl = i2c->scl;
+    
+    if(sda < 0 || scl < 0){
+        return false; //return false since there is nothing to do
     }
+    
     // if the bus is not 'clear' try the cycling SCL until SDA goes High or 9 cycles
     digitalWrite(sda, HIGH);
     digitalWrite(scl, HIGH);
     pinMode(sda, PULLUP|OPEN_DRAIN|INPUT);
     pinMode(scl, PULLUP|OPEN_DRAIN|OUTPUT);
-
+    
     if(!digitalRead(sda) || !digitalRead(scl)) { // bus in busy state
         log_w("invalid state sda(%d)=%d, scl(%d)=%d", sda, digitalRead(sda), scl, digitalRead(scl));
         digitalWrite(scl, HIGH);
@@ -1373,12 +1404,36 @@ static bool i2cCheckLineState(int8_t sda, int8_t scl){
             }
         }
     }
-
+    
     if(!digitalRead(sda) || !digitalRead(scl)) { // bus in busy state
         log_e("Bus Invalid State, TwoWire() Can't init sda=%d, scl=%d",digitalRead(sda),digitalRead(scl));
         return false; // bus is busy
     }
+    
+    i2cAttachSlaveTimer(i2c);
+    
     return true;
+}
+
+void i2cAttachSlaveTimer(i2c_t * i2c) {
+    
+    ets_timer_setfn(&timer, onTimer, NULL);
+    ets_task(eventTask, EVENTTASK_QUEUE_PRIO, eventTaskQueue, EVENTTASK_QUEUE_SIZE);
+    
+    if (twi_addr != 0) {
+        if (i2c->num == 0) {
+            attachInterrupt(i2c->scl, onSclChange_0, CHANGE);
+            attachInterrupt(i2c->sda, onSdaChange_0, CHANGE);
+        } else {
+            attachInterrupt(i2c->scl, onSclChange_1, CHANGE);
+            attachInterrupt(i2c->sda, onSdaChange_1, CHANGE);
+        }
+        
+    }
+}
+
+void i2cSetAddress(uint8_t address) {
+    twi_addr = address << 1;
 }
 
 i2c_err_t i2cAttachSCL(i2c_t * i2c, int8_t scl)
@@ -1429,17 +1484,21 @@ i2c_err_t i2cDetachSDA(i2c_t * i2c, int8_t sda)
 
 /*
  * PUBLIC API
- * */
-// 24Nov17 only supports Master Mode
+ */
+
 i2c_t * i2cInit(uint8_t i2c_num, int8_t sda, int8_t scl, uint32_t frequency) //before this is called, pins should be detached, else glitch
 {
-  log_v("num=%d sda=%d scl=%d freq=%d",i2c_num, sda, scl, frequency);
+    log_v("num=%d sda=%d scl=%d freq=%d",i2c_num, sda, scl, frequency);
     if(i2c_num > 1) {
         return NULL;
     }
-
+    
     i2c_t * i2c = &_i2c_bus_array[i2c_num];
-
+    
+    i2c->twi_data = 0x00;
+    i2c->twi_ack = 0;
+    i2c->twi_ack_rec = 0;
+    
     if(i2c->sda >= 0){
         i2cDetachSDA(i2c, i2c->sda);
     }
@@ -1448,7 +1507,7 @@ i2c_t * i2cInit(uint8_t i2c_num, int8_t sda, int8_t scl, uint32_t frequency) //b
     }
     i2c->sda = sda;
     i2c->scl = scl;
-
+    
 #if !CONFIG_DISABLE_HAL_LOCKS
     if(i2c->lock == NULL) {
         i2c->lock = xSemaphoreCreateMutex();
@@ -1458,16 +1517,21 @@ i2c_t * i2cInit(uint8_t i2c_num, int8_t sda, int8_t scl, uint32_t frequency) //b
     }
 #endif
     I2C_MUTEX_LOCK();
-
+    
     i2cReleaseISR(i2c); // ISR exists, release it before disabling hardware
-
+    
     if(frequency == 0) {// don't change existing frequency
         frequency = i2cGetFrequency(i2c);
         if(frequency == 0) {
             frequency = 100000L;    // default to 100khz
         }
+        
+        i2c->twip_mode = TWIPM_IDLE;
+        i2c->twip_state = TWIP_IDLE;
+        i2c->twip_status = TW_NO_INFO;
+        i2c->bit_count = 0;
     }
-
+    
     if(i2c_num == 0) {
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT0_RST); //reset hardware
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT0_CLK_EN);
@@ -1482,21 +1546,21 @@ i2c_t * i2cInit(uint8_t i2c_num, int8_t sda, int8_t scl, uint32_t frequency) //b
     i2c->dev->ctr.sda_force_out = 1 ;
     i2c->dev->ctr.scl_force_out = 1 ;
     i2c->dev->ctr.clk_en = 1;
-
+    
     //the max clock number of receiving  a data
     i2c->dev->timeout.tout = 400000;//clocks max=1048575
     //disable apb nonfifo access
     i2c->dev->fifo_conf.nonfifo_en = 0;
-
+    
     i2c->dev->slave_addr.val = 0;
     I2C_MUTEX_UNLOCK();
-
+    
     i2cSetFrequency(i2c, frequency);    // reconfigure
-
-    if(!i2cCheckLineState(i2c->sda, i2c->scl)){
+    
+    if(!i2cCheckLineState(i2c)){
         return NULL;
     }
-
+    
     if(i2c->sda >= 0){
         i2cAttachSDA(i2c, i2c->sda);
     }
@@ -1509,23 +1573,23 @@ i2c_t * i2cInit(uint8_t i2c_num, int8_t sda, int8_t scl, uint32_t frequency) //b
 void i2cRelease(i2c_t *i2c)  // release all resources, power down peripheral
 {
     I2C_MUTEX_LOCK();
-
+    
     if(i2c->sda >= 0){
         i2cDetachSDA(i2c, i2c->sda);
     }
     if(i2c->scl >= 0){
         i2cDetachSCL(i2c, i2c->scl);
     }
-
+    
     i2cReleaseISR(i2c);
-
+    
     if(i2c->i2c_event) {
         vEventGroupDelete(i2c->i2c_event);
         i2c->i2c_event = NULL;
     }
-
+    
     i2cFlush(i2c);
-
+    
     // reset the I2C hardware and shut off the clock, power it down.
     if(i2c->num == 0) {
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT0_RST); //reset hardware
@@ -1534,7 +1598,7 @@ void i2cRelease(i2c_t *i2c)  // release all resources, power down peripheral
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT1_RST); //reset Hardware
         DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT1_CLK_EN); // shutdown Hardware
     }
-
+    
     I2C_MUTEX_UNLOCK();
 }
 
@@ -1544,7 +1608,7 @@ i2c_err_t i2cFlush(i2c_t * i2c)
         return I2C_ERROR_DEV;
     }
     i2cTriggerDumps(i2c,i2c->debugFlags & 0xff, "FLUSH");
-
+    
     // need to grab a MUTEX for exclusive Queue,
     // what out if ISR is running?
     i2c_err_t rc=I2C_ERROR_OK;
@@ -1562,7 +1626,7 @@ i2c_err_t i2cFlush(i2c_t * i2c)
 
 i2c_err_t i2cWrite(i2c_t * i2c, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis){
     i2c_err_t last_error = i2cAddQueueWrite(i2c, address, buff, size, sendStop, NULL);
-
+    
     if(last_error == I2C_ERROR_OK) { //queued
         if(sendStop) { //now actually process the queued commands, including READs
             last_error = i2cProcQueue(i2c, NULL, timeOutMillis);
@@ -1581,7 +1645,7 @@ i2c_err_t i2cWrite(i2c_t * i2c, uint16_t address, uint8_t* buff, uint16_t size, 
 
 i2c_err_t i2cRead(i2c_t * i2c, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis, uint32_t *readCount){
     i2c_err_t last_error=i2cAddQueueRead(i2c, address, buff, size, sendStop, NULL);
-
+    
     if(last_error == I2C_ERROR_OK) { //queued
         if(sendStop) { //now actually process the queued commands, including READs
             last_error = i2cProcQueue(i2c, readCount, timeOutMillis);
@@ -1604,37 +1668,37 @@ i2c_err_t i2cSetFrequency(i2c_t * i2c, uint32_t clk_speed)
         return I2C_ERROR_DEV;
     }
     I2C_FIFO_CONF_t f;
-  
+    
     uint32_t period = (APB_CLK_FREQ/clk_speed) / 2;
     uint32_t halfPeriod = period/2;
     uint32_t quarterPeriod = period/4;
-
+    
     I2C_MUTEX_LOCK();
-
+    
     // Adjust Fifo thresholds based on frequency
     f.val    = i2c->dev->fifo_conf.val;
-    uint32_t a = (clk_speed / 50000L )+1; 
-    if (a > 24) a=24;   
+    uint32_t a = (clk_speed / 50000L )+1;
+    if (a > 24) a=24;
     f.rx_fifo_full_thrhd = 32 - a;
     f.tx_fifo_empty_thrhd = a;
     i2c->dev->fifo_conf.val = f.val; // set thresholds
     log_v("Fifo threshold=%d",a);
-
+    
     //the clock num during SCL is low level
     i2c->dev->scl_low_period.period = period;
     //the clock num during SCL is high level
     i2c->dev->scl_high_period.period = period;
-
+    
     //the clock num between the negedge of SDA and negedge of SCL for start mark
     i2c->dev->scl_start_hold.time = halfPeriod;
     //the clock num between the posedge of SCL and the negedge of SDA for restart mark
     i2c->dev->scl_rstart_setup.time = halfPeriod;
-
+    
     //the clock num after the STOP bit's posedge
     i2c->dev->scl_stop_hold.time = halfPeriod;
     //the clock num between the posedge of SCL and the posedge of SDA
     i2c->dev->scl_stop_setup.time = halfPeriod;
-
+    
     //the clock num I2C used to hold the data after the negedge of SCL.
     i2c->dev->sda_hold.time = quarterPeriod;
     //the clock num I2C used to sample data on SDA after the posedge of SCL
@@ -1666,8 +1730,8 @@ uint32_t i2cDebug(i2c_t * i2c, uint32_t setBits, uint32_t resetBits){
     }
     return 0;
     
- }
- 
+}
+
 uint32_t i2cGetStatus(i2c_t * i2c){
     if(i2c != NULL){
         return i2c->dev->status_reg.val;
@@ -1675,11 +1739,534 @@ uint32_t i2cGetStatus(i2c_t * i2c){
     else return 0;
 }
 /* todo
-  22JUL18
-    need to add multi-thread capability, use dq.queueEvent as the group marker. When multiple threads
-    transactions are present in the same queue, and an error occurs, abort all succeeding unserviced transactions
-    with the same dq.queueEvent value.  Succeeding unserviced transactions with different dq.queueEvent values
-    can be re-queued and processed independently. 
-  30JUL18 complete data only queue elements, this will allow transfers to use multiple data blocks, 
+ 22JUL18
+ need to add multi-thread capability, use dq.queueEvent as the group marker. When multiple threads
+ transactions are present in the same queue, and an error occurs, abort all succeeding unserviced transactions
+ with the same dq.queueEvent value.  Succeeding unserviced transactions with different dq.queueEvent values
+ can be re-queued and processed independently.
+ 30JUL18 complete data only queue elements, this will allow transfers to use multiple data blocks
  */
 
+// Slave support
+
+void sda_low(i2c_t * i2c) {
+    return digitalWrite(i2c->sda, 0); // Enable SDA (becomes output and since GPO is 0 for the pin, it will pull the line low)
+}
+
+void sda_high(i2c_t * i2c) {
+    return digitalWrite(i2c->sda, 1); // Disable SDA (TODO: make sure it uses pullup to go high in Init)
+}
+
+bool sda_read(i2c_t * i2c) {
+    return digitalRead(i2c->sda);
+}
+
+void scl_low(i2c_t * i2c) {
+    return digitalWrite(i2c->scl, 0);
+}
+
+void scl_high(i2c_t * i2c) {
+    return digitalWrite(i2c->scl, 1);
+}
+
+bool scl_read(i2c_t * i2c) {
+    return digitalRead(i2c->scl);
+}
+
+// TODO: Refactor to I2C transmit, allocate twin buffers (optionally to save RAM?)
+
+uint8_t i2cTransmitBus(i2c_t* i2c, const uint8_t* data, uint8_t length)
+{
+    uint8_t i;
+    
+    // ensure data will fit into buffer
+    if (length > I2C_BUFFER_LENGTH) {
+        return 1;
+    }
+    
+    // ensure we are currently a slave transmitter
+    if (i2c->twi_state != TWI_STX) {
+        return 2;
+    }
+    
+    // set length and copy data into tx buffer - TODO: Select proper buffer, this reuses one buffer for both buses
+    twi_txBufferLength = length;
+    for (i = 0; i < length; ++i) {
+        twi_txBuffer[i] = data[i];
+    }
+    
+    return 0;
+}
+
+uint8_t i2cTransmit(const uint8_t* data, uint8_t length) {
+    i2c_t * i2c = &_i2c_bus_array[0];
+    return i2cTransmitBus(i2c, data, length);
+}
+
+void twi_attachSlaveRxEvent( void (*function)(uint8_t*, size_t) )
+{
+    twi_onSlaveReceive = function;
+}
+
+void twi_attachSlaveTxEvent( void (*function)(void) )
+{
+    i2cOnSlaveTransmit = function;
+}
+
+void IRAM_ATTR i2cReply(i2c_t * i2c, uint8_t ack)
+{
+    // transmit master read ready signal, with or without ack
+    if (ack) {
+        scl_high(i2c);
+        i2c->twi_ack = 1;
+    } else {
+        scl_high(i2c);
+        i2c->twi_ack = 0;
+    }
+}
+
+void IRAM_ATTR i2cStop(i2c_t * i2c)
+{
+    // send stop condition
+    scl_high(i2c);        // _BV(TWINT)
+    i2c->twi_ack = 1;    // _BV(TWEA)
+    //twi_delay(5);    // Maybe this should be here
+    sda_high(i2c);        // _BV(TWSTO)
+    i2c->twip_state = TWI_READY;
+}
+
+void IRAM_ATTR twi_releaseBus(i2c_t * i2c)
+{
+    scl_high(i2c);
+    i2c->twi_ack = 1;
+    sda_high(i2c);
+    i2c->twip_state = TWI_READY;
+}
+
+void IRAM_ATTR i2cOnTwipEvent(i2c_t * i2c)
+{
+    switch(i2c->twip_status) {
+            // Slave Receiver
+        case TW_SR_SLA_ACK:   // addressed, returned ack
+        case TW_SR_GCALL_ACK: // addressed generally, returned ack
+        case TW_SR_ARB_LOST_SLA_ACK:   // lost arbitration, returned ack
+        case TW_SR_ARB_LOST_GCALL_ACK: // lost arbitration, returned ack
+            // enter slave receiver mode
+            i2c->twi_state = TWI_SRX;
+            // indicate that rx buffer can be overwritten and ack
+            twi_rxBufferIndex = 0;
+            i2cReply(i2c, 1);
+            break;
+        case TW_SR_DATA_ACK:       // data received, returned ack
+        case TW_SR_GCALL_DATA_ACK: // data received generally, returned ack
+            // if there is still room in the rx buffer
+            if(twi_rxBufferIndex < I2C_BUFFER_LENGTH){
+                // put byte in buffer and ack
+                twi_rxBuffer[twi_rxBufferIndex++] = i2c->twdr;
+                i2cReply(i2c, 1);
+            }else{
+                // otherwise nack
+                i2cReply(i2c, 0);
+            }
+            break;
+        case TW_SR_STOP: // stop or repeated start condition received
+            // put a null char after data if there's room
+            if(twi_rxBufferIndex < I2C_BUFFER_LENGTH){
+                twi_rxBuffer[twi_rxBufferIndex] = '\0';
+            }
+            // callback to user-defined callback over event task to allow for non-RAM-residing code
+            //twi_rxBufferLock = true; // This may be necessary
+            ets_post(EVENTTASK_QUEUE_PRIO, TWI_SIG_RX, twi_rxBufferIndex);
+            
+            // since we submit rx buffer to "wire" library, we can reset it
+            twi_rxBufferIndex = 0;
+            break;
+            
+        case TW_SR_DATA_NACK:       // data received, returned nack
+        case TW_SR_GCALL_DATA_NACK: // data received generally, returned nack
+            // nack back at master
+            i2cReply(i2c, 0);
+            break;
+            
+            // Slave Transmitter
+        case TW_ST_SLA_ACK:          // addressed, returned ack
+        case TW_ST_ARB_LOST_SLA_ACK: // arbitration lost, returned ack
+            // enter slave transmitter mode
+            i2c->twi_state = TWI_STX;
+            // ready the tx buffer index for iteration
+            twi_txBufferIndex = 0;
+            // set tx buffer length to be zero, to verify if user changes it
+            twi_txBufferLength = 0;
+            // callback to user-defined callback over event task to allow for non-RAM-residing code
+            // request for txBuffer to be filled and length to be set
+            // note: user must call i2cTransmit(&i2c, bytes, length) to do this
+            ets_post(EVENTTASK_QUEUE_PRIO, TWI_SIG_TX, 0);
+            break;
+            
+        case TW_ST_DATA_ACK: // byte sent, ack returned
+            // copy data to output register
+            i2c->twdr = twi_txBuffer[twi_txBufferIndex++];
+            
+            i2c->bit_count = 8;
+            i2c->bit_count--;
+            (i2c->twi_data & 0x80) ? sda_high(i2c) : sda_low(i2c);
+            i2c->twi_data <<= 1;
+            
+            // if there is more to send, ack, otherwise nack
+            if(twi_txBufferIndex < twi_txBufferLength){
+                i2cReply(i2c, 1);
+            }else{
+                i2cReply(i2c, 0);
+            }
+            break;
+        case TW_ST_DATA_NACK: // received nack, we are done
+        case TW_ST_LAST_DATA: // received ack, but we are done already!
+            // leave slave receiver state
+            twi_releaseBus(i2c);
+            break;
+            
+            // All
+        case TW_NO_INFO:   // no state information
+            break;
+        case TW_BUS_ERROR: // bus error, illegal stop/start
+            i2c->twi_error = I2C_ERROR_BUS;
+            i2cStop(i2c);
+            break;
+    }
+}
+
+void IRAM_ATTR onTimer()
+{
+    // Should actually checkm which bus (or use own timer per each bus)
+    for (uint8_t i; i < 2; i++) {
+        i2c_t * i2c = &_i2c_bus_array[i];
+        twi_releaseBus(i2c); // which?
+        i2c->twip_status = TW_BUS_ERROR; // deprecated protocol status, only pass-through
+        i2cOnTwipEvent(i2c);
+        i2c->twip_mode = TWIPM_WAIT;
+        i2c->twip_state = TWIP_BUS_ERR;
+    }
+}
+
+static void eventTask(ETSEvent *e) {
+    
+    if (e == NULL) {
+        return;
+    }
+    
+    // TODO: Fetch correct I2C bus, this works only for 0:
+    i2c_t * i2c = &_i2c_bus_array[0];
+    
+    switch (e->sig)
+    {
+        case TWI_SIG_TX:
+            i2cOnSlaveTransmit(); // callback to user app
+            
+            // if they didn't change buffer & length, initialize it
+            if (twi_txBufferLength == 0) {
+                twi_txBufferLength = 1;
+                twi_txBuffer[0] = 0x00;
+            }
+            
+            // Initiate transmission
+            i2cOnTwipEvent(i2c);
+            
+            break;
+            
+        case TWI_SIG_RX:
+            // ack future responses and leave slave receiver state
+            twi_releaseBus(i2c);
+            twi_onSlaveReceive(twi_rxBuffer, e->par); // callback to user app
+            break;
+    }
+}
+
+// Change ISRs (from old implementation, may deprecate)
+
+void IRAM_ATTR onSclChange_0(void) {
+    onSclChange(0);
+}
+
+void IRAM_ATTR onSdaChange_0(void) {
+    onSdaChange(0);
+}
+
+void IRAM_ATTR onSclChange_1(void) {
+    onSclChange(1);
+}
+
+void IRAM_ATTR onSdaChange_1(void) {
+    onSdaChange(1);
+}
+
+void IRAM_ATTR onSclChange(uint8_t num)
+{
+    static uint8_t sda;
+    static uint8_t scl;
+    
+    i2c_t * i2c = &_i2c_bus_array[num];
+    
+    sda    = sda_read(i2c);
+    scl = scl_read(i2c);
+    
+    i2c->twip_status = 0xF8;        // reset TWI status
+    
+    switch (i2c->twip_state)
+    {
+        case TWIP_IDLE:
+        case TWIP_WAIT_STOP:
+        case TWIP_BUS_ERR:
+            // ignore
+            break;
+            
+        case TWIP_START:
+        case TWIP_REP_START:
+        case TWIP_SLA_W:
+        case TWIP_READ:
+            if (!scl) {
+                // ignore
+            } else {
+                i2c->bit_count--;
+                i2c->twi_data <<= 1;
+                i2c->twi_data |= sda;
+                
+                if (i2c->bit_count != 0) {
+                    // continue
+                } else {
+                    i2c->twip_state = TWIP_SEND_ACK;
+                }
+            }
+            break;
+            
+        case TWIP_SEND_ACK:
+            if (scl) {
+                // ignore
+            } else {
+                if (i2c->twip_mode == TWIPM_IDLE) {
+                    if ((i2c->twi_data & 0xFE) != twi_addr) {
+                        // ignore
+                    } else {
+                        sda_low(i2c);
+                    }
+                } else {
+                    if (!i2c->twi_ack) {
+                        // ignore
+                    } else {
+                        sda_low(i2c);
+                    }
+                }
+                i2c->twip_state = TWIP_WAIT_ACK;
+            }
+            break;
+            
+        case TWIP_WAIT_ACK:
+            if (scl) {
+                // ignore
+            } else {
+                if (i2c->twip_mode == TWIPM_IDLE) {
+                    if ((i2c->twi_data & 0xFE) != twi_addr) {
+                        sda_high(i2c);
+                        i2c->twip_state = TWIP_WAIT_STOP;
+                    } else {
+                        scl_low(i2c);    // clock stretching
+                        sda_high(i2c);
+                        i2c->twip_mode = TWIPM_ADDRESSED;
+                        if (!(i2c->twi_data & 0x01)) {
+                            i2c->twip_status = TW_SR_SLA_ACK;
+                            i2cOnTwipEvent(i2c);
+                            i2c->bit_count = 8;
+                            i2c->twip_state = TWIP_SLA_W;
+                        } else {
+                            i2c->twip_status = TW_ST_SLA_ACK;
+                            i2cOnTwipEvent(i2c);
+                            i2c->twip_state = TWIP_SLA_R;
+                        }
+                    }
+                } else {
+                    scl_low(i2c);    // clock stretching
+                    sda_high(i2c);
+                    if (!i2c->twi_ack) {
+                        i2c->twip_status = TW_SR_DATA_NACK;
+                        i2cOnTwipEvent(i2c);
+                        i2c->twip_mode = TWIPM_WAIT;
+                        i2c->twip_state = TWIP_WAIT_STOP;
+                    } else {
+                        i2c->twip_status = TW_SR_DATA_ACK;
+                        i2cOnTwipEvent(i2c);
+                        i2c->bit_count = 8;
+                        i2c->twip_state = TWIP_READ;
+                    }
+                }
+            }
+            break;
+            
+        case TWIP_SLA_R:
+        case TWIP_WRITE:
+            if (scl) {
+                // ignore
+            } else {
+                i2c->bit_count--;
+                (i2c->twi_data & 0x80) ? sda_high(i2c) : sda_low(i2c);
+                i2c->twi_data <<= 1;
+                
+                if (i2c->bit_count != 0) {
+                    // continue
+                } else {
+                    i2c->twip_state = TWIP_REC_ACK;
+                }
+            }
+            break;
+            
+        case TWIP_REC_ACK:
+            if (scl) {
+                // ignore
+            } else {
+                sda_high(i2c);
+                i2c->twip_state = TWIP_READ_ACK;
+            }
+            break;
+            
+        case TWIP_READ_ACK:
+            if (!scl) {
+                // ignore
+            } else {
+                i2c->twi_ack_rec = !sda;
+                i2c->twip_state = TWIP_RWAIT_ACK;
+            }
+            break;
+            
+        case TWIP_RWAIT_ACK:
+            if (scl) {
+                // ignore
+            } else {
+                scl_low(i2c);    // clock stretching
+                if (i2c->twi_ack && i2c->twi_ack_rec) {
+                    i2c->twip_status = TW_ST_DATA_ACK;
+                    i2cOnTwipEvent(i2c);
+                    i2c->twip_state = TWIP_WRITE;
+                } else {
+                    // we have no more data to send and/or the master doesn't want anymore
+                    i2c->twip_status = i2c->twi_ack_rec ? TW_ST_LAST_DATA : TW_ST_DATA_NACK;
+                    i2cOnTwipEvent(i2c);
+                    i2c->twip_mode = TWIPM_WAIT;
+                    i2c->twip_state = TWIP_WAIT_STOP;
+                }
+            }
+            break;
+            
+        default:
+            break;
+    }
+}
+
+void IRAM_ATTR onSdaChange(uint8_t num)
+{
+    static uint8_t sda;
+    static uint8_t scl;
+    
+    i2c_t * i2c = &_i2c_bus_array[0];
+    
+    sda    = sda_read(i2c);
+    scl = scl_read(i2c);
+    
+    switch (i2c->twip_state)
+    {
+        case TWIP_IDLE:
+            if (!scl) {
+                // DATA - ignore
+            } else if (sda) {
+                // STOP - ignore
+            } else {
+                // START
+                i2c->bit_count = 8;
+                i2c->twip_state = TWIP_START;
+                ets_timer_arm(&timer, i2c_timeout_us, false); // Once, micros
+            }
+            break;
+            
+            if (sda_read(i2c)==0)
+                case TWIP_START:
+                return I2C_SDA_HELD_LOW;             //I2C bus error. SDA line held low by slave/another_master after n bits.                 case TWIP_REP_START:
+        case TWIP_SEND_ACK:
+        case TWIP_WAIT_ACK:
+        case TWIP_SLA_R:
+        case TWIP_REC_ACK:
+        case TWIP_READ_ACK:
+        case TWIP_RWAIT_ACK:
+        case TWIP_WRITE:
+            if (!scl) {
+                // DATA - ignore
+            } else {
+                // START or STOP
+                sda_high(i2c);     // Should not be necessary
+                i2c->twip_status = TW_BUS_ERROR;
+                i2cOnTwipEvent(i2c);
+                i2c->twip_mode = TWIPM_WAIT;
+                i2c->twip_state = TWIP_BUS_ERR;
+            }
+            break;
+            
+            if(!twi_write_start())
+                case TWIP_WAIT_STOP:
+                return I2C_SDA_HELD_LOW_AFTER_INIT;  //line busy. SDA again held low by another device. 2nd master?                 case TWIP_BUS_ERR:
+            if (!scl) {
+                // DATA - ignore
+            } else {
+                if (sda) {
+                    // STOP
+                    scl_low(i2c);    // clock stretching
+                    ets_timer_disarm(&timer);
+                    i2c->twip_state = TWIP_IDLE;
+                    i2c->twip_mode = TWIPM_IDLE;
+                    SCL_HIGH();
+                } else {
+                    // START
+                    if (i2c->twip_state == TWIP_BUS_ERR) {
+                        // ignore
+                    } else {
+                        i2c->bit_count = 8;
+                        i2c->twip_state = TWIP_REP_START;
+                        ets_timer_arm(&timer, i2c_timeout_us, false); // Once, micros
+                    }
+                }
+            }
+            break;
+            
+            return I2C_OK;                       //all ok
+        case TWIP_SLA_W:
+        case TWIP_READ:
+            if (!scl) {
+                // DATA - ignore
+            } else {
+                // START or STOP
+                if (i2c->bit_count != 7) {
+                    // inside byte transfer - error
+                    i2c->twip_status = TW_BUS_ERROR;
+                    i2cOnTwipEvent(i2c);
+                    i2c->twip_mode = TWIPM_WAIT;
+                    i2c->twip_state = TWIP_BUS_ERR;
+                } else {
+                    // during first bit in byte transfer - ok
+                    scl_low(i2c);    // clock stretching
+                    i2c->twip_status = TW_SR_STOP;
+                    i2cOnTwipEvent(i2c);
+                    if (sda) {
+                        // STOP
+                        ets_timer_disarm(&timer);
+                        i2c->twip_state = TWIP_IDLE;
+                        i2c->twip_mode = TWIPM_IDLE;
+                    } else {
+                        // START
+                        i2c->bit_count = 8;
+                        ets_timer_arm(&timer, i2c_timeout_us, false); // Once, micros
+                        i2c->twip_state = TWIP_REP_START;
+                        i2c->twip_mode = TWIPM_IDLE;
+                    }
+                }
+            }
+            break;
+            
+        default:
+            break;
+    }
+}

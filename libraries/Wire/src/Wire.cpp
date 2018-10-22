@@ -32,19 +32,27 @@ extern "C" {
 #include "Wire.h"
 #include "Arduino.h"
 
+uint8_t TwoWire::rxBuffer[I2C_BUFFER_LENGTH];
+uint8_t TwoWire::rxIndex = 0;
+uint8_t TwoWire::rxLength = 0;
+uint8_t TwoWire::rxQueued = 0;
+
+uint16_t TwoWire::txAddress = 0;
+uint8_t TwoWire::txBuffer[I2C_BUFFER_LENGTH];
+uint8_t TwoWire::txIndex = 0;
+uint8_t TwoWire::txLength = 0;
+uint8_t TwoWire::txQueued = 0;
+
+uint8_t TwoWire::transmitting = 0;
+
+void (*TwoWire::user_onRequest)(void);
+void (*TwoWire::user_onReceive)(int);
+
 TwoWire::TwoWire(uint8_t bus_num)
     :num(bus_num & 1)
     ,sda(-1)
     ,scl(-1)
     ,i2c(NULL)
-    ,rxIndex(0)
-    ,rxLength(0)
-    ,rxQueued(0)
-    ,txIndex(0)
-    ,txLength(0)
-    ,txAddress(0)
-    ,txQueued(0)
-    ,transmitting(0)
     ,last_error(I2C_ERROR_OK)
     ,_timeOutMillis(50)
 {}
@@ -56,6 +64,11 @@ TwoWire::~TwoWire()
         i2cRelease(i2c);
         i2c=NULL;
     }
+}
+
+bool TwoWire::begin(uint16_t address, int sdaPin, int sclPin, uint32_t frequency) {
+  i2cSetAddress(address);
+  begin(sdaPin, sclPin, frequency);
 }
 
 bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
@@ -100,6 +113,9 @@ bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
     if(!i2c) {
         return false;
     }
+
+    twi_attachSlaveTxEvent(onRequestService);
+    twi_attachSlaveRxEvent(onReceiveService);
 
     flush();
     return true;
@@ -202,7 +218,7 @@ uint8_t TwoWire::requestFrom(uint16_t address, uint8_t size, bool sendStop)
 
 size_t TwoWire::write(uint8_t data)
 {
-    if(transmitting) {
+    if (transmitting) {
         if(txLength >= I2C_BUFFER_LENGTH) {
             last_error = I2C_ERROR_MEMORY;
             return 0;
@@ -211,6 +227,8 @@ size_t TwoWire::write(uint8_t data)
         ++txIndex;
         txLength = txIndex;
         return 1;
+    } else {
+      i2cTransmit(&data, 1);
     }
     last_error = I2C_ERROR_NO_BEGIN; // no begin, not transmitting
     return 0;
@@ -218,10 +236,14 @@ size_t TwoWire::write(uint8_t data)
 
 size_t TwoWire::write(const uint8_t *data, size_t quantity)
 {
-    for(size_t i = 0; i < quantity; ++i) {
-        if(!write(data[i])) {
-            return i;
-        }
+    if (transmitting) {
+      for(size_t i = 0; i < quantity; ++i) {
+          if(!write(data[i])) {
+              return i;
+          }
+      }
+    } else {
+      i2cTransmit(data, quantity);
     }
     return quantity;
 
@@ -353,9 +375,7 @@ char * TwoWire::getErrorText(uint8_t err)
     }
 }
 
-/*stickbreaker Dump i2c Interrupt buffer, i2c isr Debugging
- */
- 
+/*stickbreaker Dump i2c Interrupt buffer, i2c isr Debugging */
 uint32_t TwoWire::setDebugFlags( uint32_t setBits, uint32_t resetBits){
   return i2cDebug(i2c,setBits,resetBits);
 }
@@ -363,6 +383,41 @@ uint32_t TwoWire::setDebugFlags( uint32_t setBits, uint32_t resetBits){
 bool TwoWire::busy(void){
   return ((i2cGetStatus(i2c) & 16 )==16);
 }
+
+/* I2C Slave */
+void TwoWire::onReceiveService(uint8_t* inBytes, size_t numBytes)
+{
+  if (!user_onReceive) {
+	   return;
+  }
+  for (uint8_t i = 0; i < numBytes; ++i) {
+	   rxBuffer[i] = inBytes[i];
+  }
+  rxIndex = 0;
+  rxLength = numBytes;
+  user_onReceive(numBytes);
+}
+
+void TwoWire::onRequestService(void)
+{
+	if (!user_onRequest) {
+		return;
+	}
+  // reset tx buffer iterator vars
+	// !!! this will kill any pending pre-master sendTo() activity
+	txIndex = 0;
+	txLength = 0;
+	user_onRequest();
+}
+
+void TwoWire::onReceive( void (*function)(int) ) {
+  user_onReceive = function;
+}
+
+void TwoWire::onRequest( void (*function)(void) ){
+  user_onRequest = function;
+}
+
 
 TwoWire Wire = TwoWire(0);
 TwoWire Wire1 = TwoWire(1);
