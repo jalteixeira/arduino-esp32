@@ -109,14 +109,23 @@ bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
 
     sda = sdaPin;
     scl = sclPin;
+    log_e("i2cInit:");
+    Serial.print("num:"); Serial.println(num);
+    Serial.print("sdaPin:"); Serial.println(sdaPin);
+    Serial.print("sclPin:"); Serial.println(sclPin);
+    Serial.print("frequency:"); Serial.println(frequency); Serial.flush();
+
     i2c = i2cInit(num, sdaPin, sclPin, frequency);
     if(!i2c) {
+        Serial.println("i2cInit:failed"); Serial.flush();
         return false;
     }
 
+    Serial.println("i2cInit:attachingEvents"); Serial.flush();
     twi_attachSlaveTxEvent(onRequestService);
     twi_attachSlaveRxEvent(onReceiveService);
 
+    Serial.println("i2cInit:flush"); Serial.flush();
     flush();
     return true;
 
