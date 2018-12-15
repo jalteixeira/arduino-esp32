@@ -31,7 +31,7 @@
 #include "Stream.h"
 
 #define STICKBREAKER V1.0.1
-
+#define I2C_BUFFER_LENGTH 128
 typedef void(*user_onRequest)(void);
 typedef void(*user_onReceive)(uint8_t*, int);
 
@@ -43,36 +43,37 @@ protected:
     int8_t scl;
     i2c_t * i2c;
 
-    static uint8_t rxBuffer[I2C_BUFFER_LENGTH];
-    static uint8_t rxIndex;
-    static uint8_t rxLength;
-    static uint8_t rxQueued; //@stickBreaker
+    uint8_t rxBuffer[I2C_BUFFER_LENGTH];
+    uint16_t rxIndex;
+    uint16_t rxLength;
+    uint16_t rxQueued; //@stickBreaker
 
-    static uint16_t txAddress;
-    static uint8_t txBuffer[I2C_BUFFER_LENGTH];
-    static uint8_t txIndex;
-    static uint8_t txLength;
-    static uint8_t txQueued; //@stickbreaker
+    uint8_t txBuffer[I2C_BUFFER_LENGTH];
+    uint16_t txIndex;
+    uint16_t txLength;
+    uint16_t txAddress;
+    uint16_t txQueued; //@stickbreaker
 
-    static uint8_t transmitting;
-    static void (*user_onRequest)(void);
-    static void (*user_onReceive)(int);
-    static void onRequestService(void);
-    static void onReceiveService(uint8_t*, size_t);
-
+    uint8_t transmitting;
+    /* slave Mode, not yet Stickbreaker
+            static user_onRequest uReq[2];
+            static user_onReceive uRcv[2];
+        void onRequestService(void);
+        void onReceiveService(uint8_t*, int);
+    */
     i2c_err_t last_error; // @stickBreaker from esp32-hal-i2c.h
     uint16_t _timeOutMillis;
 
 public:
     TwoWire(uint8_t bus_num);
     ~TwoWire();
-    bool begin(int sda=-1, int scl=-1, uint32_t frequency=0);
-    bool begin(uint16_t address, int sda=-1, int scl=-1, uint32_t frequency=0);
+    bool begin(int sda=-1, int scl=-1, uint32_t frequency=0); // returns true, if successful init of i2c bus
+      // calling will attemp to recover hung bus
 
     void setClock(uint32_t frequency); // change bus clock without initing hardware
     size_t getClock(); // current bus clock rate in hz
 
-    void setTimeOut(uint16_t timeOutMillis);
+    void setTimeOut(uint16_t timeOutMillis); // default timeout of i2c transactions is 50ms
     uint16_t getTimeOut();
 
     uint8_t lastError();
@@ -87,7 +88,6 @@ public:
     void beginTransmission(int address);
 
     uint8_t endTransmission(bool sendStop);
-    uint8_t endTransmission(uint8_t sendStop);
     uint8_t endTransmission(void);
 
     uint8_t requestFrom(uint16_t address, uint8_t size, bool sendStop);
@@ -138,7 +138,7 @@ extern TwoWire Wire1;
 
 
 /*
-V1.1 16OCT2018 Adding Slave mode support
+V1.0.2 30NOV2018 stop returning I2C_ERROR_CONTINUE on ReSTART operations, regain compatibility with Arduino libs
 V1.0.1 02AUG2018 First Fix after release, Correct ReSTART handling, change Debug control, change begin()
   to a function, this allow reporting if bus cannot be initialized, Wire.begin() can be used to recover
   a hung bus busy condition.
