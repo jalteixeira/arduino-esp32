@@ -23,30 +23,17 @@
  */
 
 extern "C" {
-#include <stdlib.h>
-#include <string.h>
-#include <inttypes.h>
+  #include <stdlib.h>
+  #include <string.h>
+  #include <inttypes.h>
 }
 
 #include "esp32-hal-i2c.h"
 #include "Wire.h"
 #include "Arduino.h"
 
-uint8_t TwoWire::rxBuffer[I2C_BUFFER_LENGTH];
-uint8_t TwoWire::rxIndex = 0;
-uint8_t TwoWire::rxLength = 0;
-uint8_t TwoWire::rxQueued = 0;
-
-uint16_t TwoWire::txAddress = 0;
-uint8_t TwoWire::txBuffer[I2C_BUFFER_LENGTH];
-uint8_t TwoWire::txIndex = 0;
-uint8_t TwoWire::txLength = 0;
-uint8_t TwoWire::txQueued = 0;
-
-uint8_t TwoWire::transmitting = 0;
-
 void (*TwoWire::user_onRequest)(void);
-void (*TwoWire::user_onReceive)(int);
+void (*TwoWire::user_onReceive)(size_t);
 
 TwoWire::TwoWire(uint8_t bus_num)
     :num(bus_num & 1)
@@ -55,7 +42,20 @@ TwoWire::TwoWire(uint8_t bus_num)
     ,i2c(NULL)
     ,last_error(I2C_ERROR_OK)
     ,_timeOutMillis(50)
-{}
+{
+  rxBuffer[I2C_BUFFER_LENGTH];
+  rxIndex = 0;
+  rxLength = 0;
+  rxQueued = 0;
+
+  txBuffer[I2C_BUFFER_LENGTH];
+  txIndex = 0;
+  txLength = 0;
+  txAddress = 0;
+  txQueued = 0;
+
+  transmitting = 0;
+}
 
 TwoWire::~TwoWire()
 {
@@ -208,19 +208,19 @@ uint8_t TwoWire::requestFrom(uint16_t address, uint8_t size, bool sendStop)
 
     last_error = readTransmission(address, &rxBuffer[cnt], size, sendStop, &cnt);
     rxIndex = 0;
-  
+
     rxLength = cnt;
-  
+
     if( last_error != I2C_ERROR_CONTINUE){ // not a  buffered ReSTART operation
       // so this operation actually moved data, queuing is done.
         rxQueued = 0;
         txQueued = 0; // the SendStop=true will restart all Queueing or error condition
     }
-  
+
     if(last_error != I2C_ERROR_OK){ // ReSTART on read does not return any data
         cnt = 0;
     }
-  
+
     return cnt;
 }
 
@@ -413,7 +413,7 @@ void TwoWire::onRequestService(void)
 	user_onRequest();
 }
 
-void TwoWire::onReceive( void (*function)(int) ) {
+void TwoWire::onReceive( void (*function)(size_t) ) {
   user_onReceive = function;
 }
 

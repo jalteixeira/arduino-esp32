@@ -33,42 +33,42 @@
 #define STICKBREAKER V1.0.1
 #define I2C_BUFFER_LENGTH 128
 typedef void(*user_onRequest)(void);
-typedef void(*user_onReceive)(uint8_t*, int);
+typedef void(*user_onReceive)(uint8_t*, size_t);
+
+static uint8_t rxBuffer[I2C_BUFFER_LENGTH];
+static uint16_t rxIndex;
+static uint16_t rxLength;
+static uint16_t rxQueued; //@stickBreaker
+
+static uint8_t txBuffer[I2C_BUFFER_LENGTH];
+static uint16_t txIndex;
+static uint16_t txLength;
+static uint16_t txAddress;
+static uint16_t txQueued; //@stickbreaker
+
+static uint8_t transmitting;
 
 class TwoWire: public Stream
 {
-protected:
+private:
     uint8_t num;
     int8_t sda;
     int8_t scl;
     i2c_t * i2c;
-
-    uint8_t rxBuffer[I2C_BUFFER_LENGTH];
-    uint16_t rxIndex;
-    uint16_t rxLength;
-    uint16_t rxQueued; //@stickBreaker
-
-    uint8_t txBuffer[I2C_BUFFER_LENGTH];
-    uint16_t txIndex;
-    uint16_t txLength;
-    uint16_t txAddress;
-    uint16_t txQueued; //@stickbreaker
-
-    uint8_t transmitting;
-    /* slave Mode, not yet Stickbreaker
-            static user_onRequest uReq[2];
-            static user_onReceive uRcv[2];
-        void onRequestService(void);
-        void onReceiveService(uint8_t*, int);
-    */
     i2c_err_t last_error; // @stickBreaker from esp32-hal-i2c.h
     uint16_t _timeOutMillis;
 
 public:
+
+  static void (*user_onRequest)(void);
+  static void (*user_onReceive)(size_t);
+  static void onRequestService(void);
+  static void onReceiveService(uint8_t*, size_t);
+
     TwoWire(uint8_t bus_num);
     ~TwoWire();
     bool begin(int sda=-1, int scl=-1, uint32_t frequency=0); // returns true, if successful init of i2c bus
-      // calling will attemp to recover hung bus
+    bool begin(uint16_t address, int sda, int scl, uint32_t frequency);
 
     void setClock(uint32_t frequency); // change bus clock without initing hardware
     size_t getClock(); // current bus clock rate in hz
@@ -79,14 +79,11 @@ public:
     uint8_t lastError();
     char * getErrorText(uint8_t err);
 
-    //@stickBreaker for big blocks and ISR model
     i2c_err_t writeTransmission(uint16_t address, uint8_t* buff, uint16_t size, bool sendStop=true);
     i2c_err_t readTransmission(uint16_t address, uint8_t* buff, uint16_t size, bool sendStop=true, uint32_t *readCount=NULL);
-
     void beginTransmission(uint16_t address);
     void beginTransmission(uint8_t address);
     void beginTransmission(int address);
-
     uint8_t endTransmission(bool sendStop);
     uint8_t endTransmission(void);
 
@@ -104,6 +101,8 @@ public:
     int read(void);
     int peek(void);
     void flush(void);
+    void onReceive( void (*)(size_t) );
+    void onRequest( void (*)(void) );
 
     inline size_t write(const char * s)
     {
@@ -125,9 +124,6 @@ public:
     {
         return write((uint8_t)n);
     }
-
-    void onReceive( void (*)(int) );
-    void onRequest( void (*)(void) );
 
     uint32_t setDebugFlags( uint32_t setBits, uint32_t resetBits);
     bool busy();
